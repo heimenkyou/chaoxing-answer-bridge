@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星作业答案桥
 // @namespace    https://github.com/heimenkyou/chaoxing-answer-bridge
-// @version      1.0.0
-// @description  从已提交的作业页提取答案，在另一账号的作答页按题目 id + 选项文本回填
+// @version      1.0.1
+// @description  从作业页提取答案，在另一账号的作答页按题目 id + 选项文本回填
 // @author       heimenkyou
 // @license      GPL-3.0
 // @homepageURL  https://github.com/heimenkyou/chaoxing-answer-bridge
@@ -76,11 +76,29 @@
         GM_setClipboard(text)
         return true
       }
+    } catch (e) {
+      /* 降级到下面的方式 */
+    }
+    try {
       await navigator.clipboard.writeText(text)
       return true
     } catch (e) {
-      return false
+      /* 页面未获得焦点时会被拒绝 */
     }
+    // 最后用临时 textarea 走 execCommand，兼容无安全上下文/无焦点的情况
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0'
+    document.body.append(ta)
+    ta.select()
+    let ok = false
+    try {
+      ok = document.execCommand('copy')
+    } catch (e) {
+      ok = false
+    }
+    ta.remove()
+    return ok
   }
 
   // ============ DOM 读取层 ============
@@ -168,11 +186,12 @@
     return [...q.querySelectorAll('.mark_answer .stuAnswerContent')]
   }
 
-  // ============ 提取（答案页） ============
+  // ============ 提取 ============
 
   /**
-   * 从已提交作业页提取答案。
+   * 从作业页提取答案。
    * @param {'correct'|'mine'} source correct=正确答案（缺失时退回我的答案）；mine=只用本账号作答
+   * 已提交页读 .mark_answer 的答案节点；未提交页读当前已选中的选项和编辑器内容。
    * 客观题同时保留原始字母和选项文本：字母在两个账号间会被各自打乱，只有文本可信。
    */
   function extractAnswers(source = 'correct') {
@@ -198,6 +217,14 @@
 
       if (type === 'single' || type === 'multiple' || type === 'judge') {
         const rightNodes = pickNodes()
+        if (!rightNodes.length) {
+          // 未提交的作答页：以当前页面已选中的选项为答案
+          const checked = options.filter(o => o.checked)
+          item.letters = checked.map(o => o.key)
+          item.texts = checked.map(o => o.text)
+          items.push(item)
+          continue
+        }
         const rightRaw = rightNodes.map(n => n.textContent.trim()).join(' ')
 
         if (type === 'judge') {
@@ -404,6 +431,9 @@
   #${PANEL_ID} button.act:hover{background:#f1f5f9}
   #${PANEL_ID} button.primary{background:#1a56db;border-color:#1a56db;color:#fff}
   #${PANEL_ID} button.primary:hover{background:#1546b4}
+  #${PANEL_ID} button.linkbtn{align-self:flex-start;border:0;background:transparent;color:#1a56db;
+    font-size:12px;cursor:pointer;padding:0}
+  #${PANEL_ID} button.linkbtn:hover{text-decoration:underline}
   #${PANEL_ID} .stat{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:#475569}
   #${PANEL_ID} .stat span b{color:#0f172a}
   #${PANEL_ID} .list{max-height:230px;overflow:auto;border:1px solid #eef1f5;border-radius:6px}
@@ -496,6 +526,35 @@
     })
   }
 
+  /** 按来源提取成可传输的 payload */
+  function buildPayload(source) {
+    const items = extractAnswers(source)
+    const byType = items.reduce((m, it) => ((m[it.type] = (m[it.type] || 0) + 1), m), {})
+    return {
+      v: 2,
+      meta: {
+        title: document.title,
+        url: location.href,
+        workId: new URLSearchParams(location.search).get('workId') || '',
+        source,
+        extractedAt: new Date().toISOString(),
+        total: items.length,
+        byType,
+        emptyCount: items.filter(it => !it.texts.length).length,
+      },
+      items,
+    }
+  }
+
+  /** 写剪贴板，并在按钮上给出短反馈 */
+  async function copyPayload(payload, btn) {
+    const ok = await copyText(JSON.stringify(payload))
+    const origin = btn.textContent
+    btn.textContent = ok ? `已复制 ${payload.items.length} 题` : '复制失败'
+    setTimeout(() => (btn.textContent = origin), 1500)
+    return ok
+  }
+
   // ---------- 提取模式 ----------
 
   function renderExtract(body, badge) {
@@ -506,26 +565,6 @@
 
     body.append(el('div', { className: 'row' }, [copyCorrect, copyMine]), stats, list,
       el('div', { className: 'tip', textContent: '复制后在作答页粘贴，点「预览匹配」。' }))
-
-    /** 按来源提取成 payload */
-    function collect(source) {
-      const items = extractAnswers(source)
-      const byType = items.reduce((m, it) => ((m[it.type] = (m[it.type] || 0) + 1), m), {})
-      return {
-        v: 2,
-        meta: {
-          title: document.title,
-          url: location.href,
-          workId: new URLSearchParams(location.search).get('workId') || '',
-          source,
-          extractedAt: new Date().toISOString(),
-          total: items.length,
-          byType,
-          emptyCount: items.filter(it => !it.texts.length).length,
-        },
-        items,
-      }
-    }
 
     /** 展示提取结果，供人工核对 */
     function render(payload) {
@@ -555,12 +594,9 @@
 
     /** 提取 + 写剪贴板 */
     async function copyWith(source, btn) {
-      const payload = collect(source)
+      const payload = buildPayload(source)
       render(payload)
-      const ok = await copyText(JSON.stringify(payload))
-      const origin = btn.textContent
-      btn.textContent = ok ? `已复制 ${payload.items.length} 题` : '复制失败'
-      setTimeout(() => (btn.textContent = origin), 1500)
+      await copyPayload(payload, btn)
       log(`复制${source === 'mine' ? '我的答案' : '正确答案'}：${payload.items.length} 题，无答案 ${payload.meta.emptyCount} 题`)
     }
 
@@ -568,7 +604,7 @@
     copyMine.onclick = () => copyWith('mine', copyMine)
 
     // 打开面板先按正确答案提取一份，方便直接核对题目和答案
-    render(collect('correct'))
+    render(buildPayload('correct'))
   }
 
   // ---------- 填写模式 ----------
@@ -577,13 +613,25 @@
     const ta = el('textarea', { placeholder: '粘贴提取页复制的答案，点「预览匹配」' })
     const previewBtn = el('button', { className: 'act primary', textContent: '预览匹配' })
     const applyBtn = el('button', { className: 'act', textContent: '执行填写' })
+    const exportBtn = el('button', { className: 'linkbtn', textContent: '复制本页当前作答' })
     const stats = el('div', { className: 'stat' })
     const list = el('div', { className: 'list' })
     // 面板隐藏后重新打开时，恢复上次粘贴的内容
     if (state.payload) ta.value = JSON.stringify(state.payload)
 
-    body.append(ta, el('div', { className: 'row' }, [previewBtn, applyBtn]), stats, list,
+    body.append(ta, el('div', { className: 'row' }, [previewBtn, applyBtn]), exportBtn, stats, list,
       el('div', { className: 'tip', textContent: '预览不修改页面；执行后仍需自己点提交。' }))
+
+    // 未提交的作答页也能当答案来源：导出本页已选中的选项
+    exportBtn.onclick = async () => {
+      const payload = buildPayload('mine')
+      await copyPayload(payload, exportBtn)
+      stats.innerHTML = ''
+      stats.append(
+        el('span', { innerHTML: `本页作答 <b>${payload.items.length}</b>` }),
+        el('span', { innerHTML: `未作答 <b>${payload.meta.emptyCount}</b>` }),
+      )
+    }
 
     function loadPayload() {
       if (!ta.value.trim()) {
@@ -718,4 +766,3 @@
 
   boot()
 })()
-
