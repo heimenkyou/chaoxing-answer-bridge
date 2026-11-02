@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星作业答案桥
 // @namespace    https://github.com/heimenkyou/chaoxing-answer-bridge
-// @version      1.1.0
+// @version      1.1.1
 // @description  从作业或考试页提取答案，在另一账号按题目 id + 选项文本回填
 // @author       heimenkyou
 // @license      GPL-3.0
@@ -426,16 +426,77 @@
     )
   }
 
+  function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms))
+  }
+
+  /** 等页面自己的保存请求结束；页面保存期间会把 submitOnce 置为 true 并跳过后续保存 */
+  async function waitSaveIdle(w = pageWindow(), timeout = 12000) {
+    const start = Date.now()
+    while (w && w.submitOnce === true) {
+      if (Date.now() - start > timeout) return false
+      await sleep(120)
+    }
+    return true
+  }
+
+  /** 主观题输入框旁边的「保存」按钮，id 形如 save_{dataStr} */
+  function findSaveButton(ta) {
+    const dataStr = (ta.id || '').replace(/^answer(Editor)?/, '')
+    if (!dataStr) return null
+    const byId = document.getElementById('save_' + dataStr)
+    if (byId) return byId
+    const q = ta.closest('.questionLi')
+    if (!q) return null
+    return [...q.querySelectorAll('a[onclick*="saveQuestion"]')].find(a =>
+      (a.getAttribute('onclick') || '').includes("'" + dataStr + "'"),
+    ) || null
+  }
+
+  /** 收尾：整卷保存一次，再刷新右侧答题卡 */
+  async function flushSave() {
+    const w = pageWindow()
+    await waitSaveIdle(w)
+    if (typeof w.submitForm === 'function') {
+      try {
+        w.submitForm(true)
+      } catch (e) {
+        log('整卷保存失败：' + e.message)
+      }
+      await waitSaveIdle(w)
+    }
+    if (typeof w.changeQuestionCardColor === 'function') {
+      for (const q of allQuestions()) {
+        const id = q.getAttribute('data')
+        if (!id) continue
+        try {
+          w.changeQuestionCardColor(id)
+        } catch (e) {
+          /* 单题刷新失败不影响其他 */
+        }
+      }
+    }
+  }
+
   /** 执行单题的填写动作 */
-  function applyPlan(plan) {
+  async function applyPlan(plan) {
+    const w = pageWindow()
     for (const act of plan.actions) {
       try {
+        await waitSaveIdle(w)
         if (act.kind === 'click') act.el.click()
         else if (act.kind === 'fill') {
           if (!fillBlank(act.el, act.text, act.html)) {
             plan.status = 'error'
             const note = '拿不到编辑器实例，内容未写入'
             if (!plan.notes.includes(note)) plan.notes.push(note)
+            continue
+          }
+          // 主观题不点保存不会入库，和手动作答一样要点输入框旁的「保存」
+          const saveBtn = findSaveButton(act.el)
+          if (saveBtn) {
+            await waitSaveIdle(w)
+            saveBtn.click()
           }
         }
       } catch (e) {
@@ -769,16 +830,27 @@
       renderPlans(state.plans)
     }
 
-    applyBtn.onclick = () => {
+    applyBtn.onclick = async () => {
       const payload = loadPayload()
       if (!payload) return
       if (!state.plans.length) state.plans = buildPlans(payload)
       const previous = state.plans.slice()
+      const total = state.plans.filter(p => p.q && p.actions.length).length
       let done = 0
-      for (const plan of state.plans) {
-        if (!plan.q) continue
-        if (plan.actions.length) done++
-        applyPlan(plan)
+      applyBtn.disabled = true
+      try {
+        for (const plan of state.plans) {
+          if (!plan.q) continue
+          if (plan.actions.length) {
+            done++
+            badge.textContent = `填写中 ${done}/${total}`
+          }
+          await applyPlan(plan)
+        }
+        badge.textContent = '保存中…'
+        await flushSave()
+      } finally {
+        applyBtn.disabled = false
       }
       // 执行后重新核验页面状态，并把写入阶段的问题带过来
       state.plans = buildPlans(payload)
