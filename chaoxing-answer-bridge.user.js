@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         超星作业答案桥
 // @namespace    https://github.com/heimenkyou/chaoxing-answer-bridge
-// @version      1.0.1
-// @description  从作业页提取答案，在另一账号的作答页按题目 id + 选项文本回填
+// @version      1.1.0
+// @description  从作业或考试页提取答案，在另一账号按题目 id + 选项文本回填
 // @author       heimenkyou
 // @license      GPL-3.0
 // @homepageURL  https://github.com/heimenkyou/chaoxing-answer-bridge
@@ -14,6 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -120,7 +121,7 @@
     if (!h3) return ''
     let text = h3.textContent || ''
     text = text.replace(/^\s*\d+\s*[.、．]\s*/, '')
-    text = text.replace(/[(（](单选题?|多选题?|判断题?|填空题?|简答题?|计算题?|名词解释|论述题?|资料题?|材料题?)[)）]/g, '')
+    text = text.replace(/[(（](单选题?|多选题?|判断题?|填空题?|简答题?|计算题?|名词解释|论述题?|资料题?|材料题?)[^)）]*[)）]/g, '')
     return squash(text)
   }
 
@@ -151,16 +152,21 @@
   function readOptions(q) {
     const nodes = [...q.querySelectorAll('.stem_answer .answerBg')]
     if (nodes.length) {
-      return nodes.map(el => {
+      const list = nodes.map(el => {
         const dataSpan = el.querySelector('span[data]')
         return {
           el,
           key: (el.querySelector('span.num_option, span.num_option_dx')?.textContent || '').trim(),
           bankKey: dataSpan?.getAttribute('data') || '',
           text: norm(el.querySelector('.answer_p')?.textContent || el.textContent),
-          checked: el.getAttribute('aria-checked') === 'true',
+          // 选中态的权威标记是选项字母上的 check_answer / check_answer_dx 类名
+          byClass: /(^|\s)check_answer(_dx)?(\s|$)/.test(dataSpan?.className || ''),
+          byAria: el.getAttribute('aria-checked') === 'true',
         }
       })
+      // 页面上有 class 标记时以 class 为准：考试页切换选项后 aria-checked 会残留旧值
+      const useClass = list.some(o => o.byClass)
+      return list.map(o => ({ ...o, checked: useClass ? o.byClass : o.byAria }))
     }
     // 已提交页的选项是纯文本列表
     return [...q.querySelectorAll('ul.qtDetail li')].map(el => {
@@ -184,6 +190,74 @@
   /** 读取"我的答案"节点，即该账号自己的作答 */
   function readMyNodes(q) {
     return [...q.querySelectorAll('.mark_answer .stuAnswerContent')]
+  }
+
+  /** 页面真实 window：脚本管理器的沙箱里拿不到页面全局对象，需要 unsafeWindow */
+  function pageWindow() {
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow
+    } catch (e) {
+      /* 非沙箱环境没有 unsafeWindow */
+    }
+    return window
+  }
+
+  /** 读取 UEditor 实例，拿不到返回 null */
+  function getEditor(id) {
+    const UE = pageWindow().UE
+    if (!UE || typeof UE.getEditor !== 'function') return null
+    try {
+      const ed = UE.getEditor(id, undefined, true)
+      if (ed) return ed
+    } catch (e) {
+      /* 编辑器尚未就绪 */
+    }
+    try {
+      return UE.getEditor(id) || null
+    } catch (e) {
+      return null
+    }
+  }
+
+  /** 该输入框旁边是否有 UEditor 容器（用来区分普通 textarea 与编辑器字段） */
+  function hasEditorAround(ta) {
+    return !!ta.parentElement?.querySelector('.edui-editor, [class*="edui-"]')
+  }
+
+  /** HTML 转纯文本，保留段落换行 */
+  function htmlToText(html) {
+    const div = document.createElement('div')
+    div.innerHTML = String(html || '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li)>/gi, '\n')
+    return (div.textContent || '').replace(/\u00a0/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+  }
+
+  /** 纯文本转 HTML，用于没有 HTML 来源时写入编辑器 */
+  function textToHtml(text) {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>')
+  }
+
+  /** 主观题的输入框，按页面顺序即空位顺序 */
+  function answerFields(q) {
+    return [...q.querySelectorAll('textarea')].filter(t => /^answer/i.test(t.id || ''))
+  }
+
+  /** 读输入框当前内容：有编辑器取编辑器，否则取 textarea */
+  function fieldHtml(ta) {
+    const ed = getEditor(ta.id)
+    if (ed && typeof ed.getContent === 'function') {
+      try {
+        return ed.getContent()
+      } catch (e) {
+        /* 编辑器尚未就绪时退回 textarea */
+      }
+    }
+    return ta.value || ''
   }
 
   // ============ 提取 ============
@@ -239,12 +313,19 @@
             .filter(Boolean)
         }
       } else {
-        // 主观题：按空收集答案文本
+        // 主观题：按空收集答案；编辑器里的段落结构用 HTML 保留
         const nodes = pickNodes()
-        item.texts = nodes.map(n => richText(n))
-        if (!item.texts.length) {
-          const tas = [...q.querySelectorAll('textarea')]
-          item.texts = tas.map(t => editorContent(t.id) || t.value || '')
+        if (nodes.length) {
+          item.texts = nodes.map(n => richText(n))
+          item.htmls = nodes.map(n => (n.innerHTML ? n.innerHTML.trim() : null))
+        } else {
+          item.htmls = []
+          item.texts = answerFields(q).map(t => {
+            const ed = getEditor(t.id)
+            const html = ed ? ed.getContent() : t.value || ''
+            item.htmls.push(html || null)
+            return htmlToText(html)
+          })
         }
       }
       items.push(item)
@@ -259,17 +340,6 @@
       return [...paras].map(p => p.textContent.trim()).filter(Boolean).join('\n')
     }
     return (el.textContent || '').trim()
-  }
-
-  /** 读取 UEditor 实例内容 */
-  function editorContent(id) {
-    try {
-      const ed = window.UE?.getEditor?.(id, undefined, true)
-      if (ed && typeof ed.getContentTxt === 'function') return ed.getContentTxt().trim()
-    } catch (e) {
-      /* 编辑器未就绪 */
-    }
-    return ''
   }
 
   // ============ 填写（作答页） ============
@@ -311,26 +381,30 @@
       return plan
     }
 
-    // 主观题：答案按空顺序填入
-    const blanks = [...q.querySelectorAll('.stem_answer textarea')].filter(t => /^answer/i.test(t.id))
+    // 主观题：答案按空顺序填入，空答案跳过但占位
+    const blanks = answerFields(q)
     if (!blanks.length) {
       plan.status = 'error'
       plan.notes.push('找不到答题编辑器')
       return plan
     }
-    const texts = item.texts.filter(t => (t || '').trim() !== '')
-    if (!texts.length) {
+    const texts = item.texts || []
+    if (!texts.some(t => (t || '').trim())) {
       plan.status = 'unmatched'
       plan.notes.push('答案为空')
       return plan
     }
-    blanks.forEach((ta, i) => {
-      if (i < texts.length) plan.actions.push({ kind: 'fill', el: ta, text: texts[i] })
+    texts.forEach((text, i) => {
+      if (!(text || '').trim()) return
+      if (i >= blanks.length) {
+        plan.notes.push(`第 ${i + 1} 空在本页没有对应输入框`)
+        return
+      }
+      // 已经是目标内容就不用再写，便于回填后核验
+      if (norm(htmlToText(fieldHtml(blanks[i]))) === norm(text)) return
+      plan.actions.push({ kind: 'fill', el: blanks[i], text, html: item.htmls?.[i] || null })
     })
-    if (blanks.length < texts.length) {
-      plan.status = 'partial'
-      plan.notes.push(`有 ${texts.length} 个答案但只有 ${blanks.length} 个输入框`)
-    }
+    if (plan.notes.length) plan.status = 'partial'
     return plan
   }
 
@@ -357,7 +431,13 @@
     for (const act of plan.actions) {
       try {
         if (act.kind === 'click') act.el.click()
-        else if (act.kind === 'fill') fillBlank(act.el, act.text)
+        else if (act.kind === 'fill') {
+          if (!fillBlank(act.el, act.text, act.html)) {
+            plan.status = 'error'
+            const note = '拿不到编辑器实例，内容未写入'
+            if (!plan.notes.includes(note)) plan.notes.push(note)
+          }
+        }
       } catch (e) {
         plan.status = 'error'
         plan.notes.push('执行失败：' + e.message)
@@ -366,23 +446,28 @@
     return plan
   }
 
-  /** 向 textarea 及其 UEditor 实例写入内容 */
-  function fillBlank(ta, text) {
-    ta.value = text
-    const ed = (() => {
-      try {
-        return window.UE?.getEditor?.(ta.id, undefined, true)
-      } catch (e) {
-        return null
-      }
-    })()
+  /**
+   * 向 textarea 及其 UEditor 实例写入内容；html 用于保留段落结构。
+   * @returns {boolean} 是否写入成功
+   */
+  function fillBlank(ta, text, html) {
+    const ed = getEditor(ta.id)
     if (ed && typeof ed.setContent === 'function') {
-      // 同步编辑器视图，否则提交时仍是旧内容
-      ed.setContent(text.replace(/\n/g, '<br>'), false)
+      const content = html || textToHtml(text)
+      ed.setContent(content, false)
+      // setContent 一般不回写 textarea，而提交时读的是 textarea
+      if (typeof ed.sync === 'function') ed.sync()
+      ta.value = content
+    } else if (hasEditorAround(ta)) {
+      // 页面上有编辑器却拿不到实例：只改 textarea 会造成"看起来空白、提交内容也可能为空"，直接报错
+      return false
+    } else {
+      ta.value = text
     }
     ta.dispatchEvent(new Event('input', { bubbles: true }))
     ta.dispatchEvent(new Event('change', { bubbles: true }))
     ta.dispatchEvent(new Event('blur', { bubbles: true }))
+    return true
   }
 
   /** 按题目 id 对齐；id 缺失时退回题干文本 */
@@ -688,14 +773,25 @@
       const payload = loadPayload()
       if (!payload) return
       if (!state.plans.length) state.plans = buildPlans(payload)
+      const previous = state.plans.slice()
       let done = 0
       for (const plan of state.plans) {
         if (!plan.q) continue
         if (plan.actions.length) done++
         applyPlan(plan)
       }
-      // 执行后重新核验一遍页面状态
+      // 执行后重新核验页面状态，并把写入阶段的问题带过来
       state.plans = buildPlans(payload)
+      state.plans.forEach((p, i) => {
+        const prev = previous[i]
+        if (prev && prev.status === 'error') {
+          p.status = 'error'
+          p.notes = prev.notes
+        } else if (p.status === 'ok' && p.actions.length) {
+          p.status = 'error'
+          p.notes = ['写入后页面状态没有变化']
+        }
+      })
       renderPlans(state.plans)
       const bad = state.plans.filter(p => p.status !== 'ok')
       log(`填写完成：处理 ${done} 题，异常 ${bad.length} 题`)
@@ -749,6 +845,8 @@
   function boot() {
     if (!document.querySelector('.questionLi')) return
     if (document.getElementById(PANEL_ID)) return
+    // 逐题模式的考试页不处理，只支持整卷预览
+    if (/\/exam\/test\//.test(location.pathname)) return
 
     document.head.append(el('style', { textContent: CSS }))
 
