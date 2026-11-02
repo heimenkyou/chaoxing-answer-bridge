@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星作业答案桥
 // @namespace    https://github.com/heimenkyou/chaoxing-answer-bridge
-// @version      1.1.1
+// @version      1.1.2
 // @description  从作业或考试页提取答案，在另一账号按题目 id + 选项文本回填
 // @author       heimenkyou
 // @license      GPL-3.0
@@ -316,15 +316,22 @@
         // 主观题：按空收集答案；编辑器里的段落结构用 HTML 保留
         const nodes = pickNodes()
         if (nodes.length) {
-          item.texts = nodes.map(n => richText(n))
-          item.htmls = nodes.map(n => (n.innerHTML ? n.innerHTML.trim() : null))
+          item.texts = []
+          item.htmls = []
+          for (const n of nodes) {
+            for (const part of parseAnswerNode(n, type)) {
+              item.texts.push(part.text)
+              item.htmls.push(type === 'fill' ? null : part.html)
+            }
+          }
         } else {
           item.htmls = []
           item.texts = answerFields(q).map(t => {
             const ed = getEditor(t.id)
             const html = ed ? ed.getContent() : t.value || ''
             item.htmls.push(html || null)
-            return htmlToText(html)
+            const text = htmlToText(html)
+            return type === 'fill' ? stripBlankNo(text) : text
           })
         }
       }
@@ -340,6 +347,48 @@
       return [...paras].map(p => p.textContent.trim()).filter(Boolean).join('\n')
     }
     return (el.textContent || '').trim()
+  }
+
+  /** 去掉 "(1)" "（2）" 这类空位编号 */
+  function stripBlankNo(text) {
+    return String(text || '').replace(/^[(（]\s*\d+\s*[)）]\s*/, '').trim()
+  }
+
+  /**
+   * 把「正确答案」节点拆成按空排列的答案。
+   * 填空题的正确答案常写成「(1) 甲 / (2) 乙」，编号不能进入答案文本。
+   * @returns {{text: string, html: string|null}[]}
+   */
+  function parseAnswerNode(node, type) {
+    const html = (node.innerHTML || '').trim()
+    const text = richText(node)
+    if (type !== 'fill' || !/[(（]\s*\d+\s*[)）]/.test(text)) {
+      return [{ text, html: html || null }]
+    }
+
+    const groups = []
+    let cur = null
+    for (const rawLine of text.split('\n')) {
+      const line = rawLine.trim()
+      const m = line.match(/^[(（]\s*\d+\s*[)）]\s*(.*)$/)
+      if (m) {
+        // 连续出现的编号（如单独一行 "(1)" 后面又写一次）归到同一个空
+        if (cur && cur.length === 0) {
+          if (m[1]) cur.push(m[1])
+        } else {
+          cur = m[1] ? [m[1]] : []
+          groups.push(cur)
+        }
+      } else if (line) {
+        if (cur) cur.push(line)
+        else {
+          cur = [line]
+          groups.push(cur)
+        }
+      }
+    }
+    if (!groups.length) return [{ text: '', html: null }]
+    return groups.map(g => ({ text: stripBlankNo(g.join('\n')), html: null }))
   }
 
   // ============ 填写（作答页） ============
@@ -394,7 +443,9 @@
       plan.notes.push('答案为空')
       return plan
     }
-    texts.forEach((text, i) => {
+    texts.forEach((rawText, i) => {
+      // 填空的答案里不允许再带 "(1)" 这类空位编号
+      const text = type === 'fill' ? stripBlankNo(rawText) : rawText
       if (!(text || '').trim()) return
       if (i >= blanks.length) {
         plan.notes.push(`第 ${i + 1} 空在本页没有对应输入框`)
@@ -402,7 +453,12 @@
       }
       // 已经是目标内容就不用再写，便于回填后核验
       if (norm(htmlToText(fieldHtml(blanks[i]))) === norm(text)) return
-      plan.actions.push({ kind: 'fill', el: blanks[i], text, html: item.htmls?.[i] || null })
+      plan.actions.push({
+        kind: 'fill',
+        el: blanks[i],
+        text,
+        html: type === 'fill' ? null : item.htmls?.[i] || null,
+      })
     })
     if (plan.notes.length) plan.status = 'partial'
     return plan
