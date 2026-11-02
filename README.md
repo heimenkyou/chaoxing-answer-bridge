@@ -63,6 +63,12 @@
 - 资料题（材料+多小问）没有在真实页面上验证过
 - 不自动提交
 
+## 开发
+
+- [`docs/dom-notes.md`](docs/dom-notes.md)：三类页面的 DOM 结构、答案节点、编辑器、考试页保存机制
+- [`docs/debugging.md`](docs/debugging.md)：起双实例调试环境、注入脚本、验证是否真的保存成功
+- [`tools/cdp.mjs`](tools/cdp.mjs)：零依赖 CDP 调试客户端，用来读写页面 DOM 和截图
+
 ## 许可
 
 [GPL-3.0](LICENSE)
