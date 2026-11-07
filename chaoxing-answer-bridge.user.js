@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星作业答案桥
 // @namespace    https://github.com/heimenkyou/chaoxing-answer-bridge
-// @version      1.1.2
+// @version      1.2.0
 // @description  从作业或考试页提取答案，在另一账号按题目 id + 选项文本回填
 // @author       heimenkyou
 // @license      GPL-3.0
@@ -103,6 +103,15 @@
   }
 
   // ============ DOM 读取层 ============
+
+  /** 作业/考试名称，用于导出文件名；页面没有标题节点时退回文档标题 */
+  function workName() {
+    const node = document.querySelector('.mark_title')
+    const text = (node?.textContent || document.title || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    return text || '作业'
+  }
 
   /** 找到页面上全部题目容器 */
   function allQuestions() {
@@ -633,9 +642,11 @@
   #${PANEL_ID} button.act:hover{background:#f1f5f9}
   #${PANEL_ID} button.primary{background:#1a56db;border-color:#1a56db;color:#fff}
   #${PANEL_ID} button.primary:hover{background:#1546b4}
-  #${PANEL_ID} button.linkbtn{align-self:flex-start;border:0;background:transparent;color:#1a56db;
-    font-size:12px;cursor:pointer;padding:0}
-  #${PANEL_ID} button.linkbtn:hover{text-decoration:underline}
+  #${PANEL_ID} .tools{display:flex;gap:6px;padding-top:8px;border-top:1px solid #eef1f5}
+  #${PANEL_ID} button.tool{flex:1;padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;
+    background:#f8fafc;cursor:pointer;font-size:12px;color:#475569}
+  #${PANEL_ID} button.tool:hover{background:#eef2f7;color:#0f172a}
+  #${PANEL_ID} button.tool:disabled{opacity:.55;cursor:default}
   #${PANEL_ID} .stat{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:#475569}
   #${PANEL_ID} .stat span b{color:#0f172a}
   #${PANEL_ID} .list{max-height:230px;overflow:auto;border:1px solid #eef1f5;border-radius:6px}
@@ -736,6 +747,7 @@
       v: 2,
       meta: {
         title: document.title,
+        name: workName(),
         url: location.href,
         workId: new URLSearchParams(location.search).get('workId') || '',
         source,
@@ -757,16 +769,41 @@
     return ok
   }
 
+  /** 存成 JSON 文件，用于发给他人或换设备后导入 */
+  function downloadPayload(payload) {
+    const d = new Date()
+    const p2 = n => String(n).padStart(2, '0')
+    const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}`
+    const source = payload.meta?.source === 'mine' ? '我的答案' : '正确答案'
+    const base = (payload.meta?.name || payload.meta?.workId || '作业').slice(0, 40)
+    // 文件名不能带路径分隔符等字符
+    const name = `答案桥-${base}-${source}-${stamp}.json`.replace(/[\\/:*?"<>|\r\n]+/g, '_')
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
+    const a = el('a', { href: url, download: name })
+    document.body.append(a)
+    a.click()
+    a.remove()
+    // 立即回收会让部分浏览器来不及下载
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return name
+  }
+
   // ---------- 提取模式 ----------
 
   function renderExtract(body, badge) {
     const copyCorrect = el('button', { className: 'act primary', textContent: '复制正确答案' })
     const copyMine = el('button', { className: 'act', textContent: '复制我的答案' })
+    const exportBtn = el('button', { className: 'tool', textContent: '导出文件（.json）' })
     const stats = el('div', { className: 'stat' })
     const list = el('div', { className: 'list' })
 
-    body.append(el('div', { className: 'row' }, [copyCorrect, copyMine]), stats, list,
-      el('div', { className: 'tip', textContent: '复制后在作答页粘贴，点「预览匹配」。' }))
+    body.append(
+      el('div', { className: 'row' }, [copyCorrect, copyMine]),
+      el('div', { className: 'tools' }, [exportBtn]),
+      stats,
+      list,
+      el('div', { className: 'tip', textContent: '复制或导出后在作答页粘贴或导入，点「预览匹配」。' }),
+    )
 
     /** 展示提取结果，供人工核对 */
     function render(payload) {
@@ -804,6 +841,12 @@
 
     copyCorrect.onclick = () => copyWith('correct', copyCorrect)
     copyMine.onclick = () => copyWith('mine', copyMine)
+    exportBtn.onclick = () => {
+      const name = downloadPayload(state.payload || buildPayload('correct'))
+      exportBtn.textContent = '已导出'
+      exportBtn.title = name
+      setTimeout(() => (exportBtn.textContent = '导出文件（.json）'), 1500)
+    }
 
     // 打开面板先按正确答案提取一份，方便直接核对题目和答案
     render(buildPayload('correct'))
@@ -812,27 +855,60 @@
   // ---------- 填写模式 ----------
 
   function renderFill(body, badge) {
-    const ta = el('textarea', { placeholder: '粘贴提取页复制的答案，点「预览匹配」' })
+    const ta = el('textarea', { placeholder: '粘贴答案 JSON，或点下方「导入文件」，再点「预览匹配」' })
     const previewBtn = el('button', { className: 'act primary', textContent: '预览匹配' })
     const applyBtn = el('button', { className: 'act', textContent: '执行填写' })
-    const exportBtn = el('button', { className: 'linkbtn', textContent: '复制本页当前作答' })
+    const importBtn = el('button', { className: 'tool', textContent: '导入文件' })
+    const copyBtn = el('button', { className: 'tool', textContent: '复制本页作答' })
+    const exportBtn = el('button', { className: 'tool', textContent: '导出本页作答' })
+    const importInput = el('input', { type: 'file', accept: '.json,application/json', hidden: true })
     const stats = el('div', { className: 'stat' })
     const list = el('div', { className: 'list' })
     // 面板隐藏后重新打开时，恢复上次粘贴的内容
     if (state.payload) ta.value = JSON.stringify(state.payload)
 
-    body.append(ta, el('div', { className: 'row' }, [previewBtn, applyBtn]), exportBtn, stats, list,
-      el('div', { className: 'tip', textContent: '预览不修改页面；执行后仍需自己点提交。' }))
+    body.append(
+      ta,
+      el('div', { className: 'row' }, [previewBtn, applyBtn]),
+      el('div', { className: 'tools' }, [importBtn, copyBtn, exportBtn]),
+      importInput,
+      stats,
+      list,
+      el('div', { className: 'tip', textContent: '预览不修改页面；执行后仍需自己点提交。' }),
+    )
+
+    // 选导入而非粘贴时，直接读文件内容填进文本框
+    importBtn.onclick = () => importInput.click()
+    importInput.onchange = async () => {
+      const file = importInput.files?.[0]
+      // 清空后同一个文件才能再次选中
+      importInput.value = ''
+      if (!file) return
+      try {
+        ta.value = await file.text()
+      } catch (e) {
+        stats.innerHTML = `<span style="color:#dc2626">读取文件失败：${e.message}</span>`
+        return
+      }
+      runPreview()
+    }
 
     // 未提交的作答页也能当答案来源：导出本页已选中的选项
-    exportBtn.onclick = async () => {
+    copyBtn.onclick = async () => {
       const payload = buildPayload('mine')
-      await copyPayload(payload, exportBtn)
+      await copyPayload(payload, copyBtn)
       stats.innerHTML = ''
       stats.append(
         el('span', { innerHTML: `本页作答 <b>${payload.items.length}</b>` }),
         el('span', { innerHTML: `未作答 <b>${payload.meta.emptyCount}</b>` }),
       )
+    }
+
+    // 同一份作答也可下载成文件，交给别人或其他设备导入
+    exportBtn.onclick = () => {
+      downloadPayload(buildPayload('mine'))
+      exportBtn.textContent = '已导出'
+      setTimeout(() => (exportBtn.textContent = '导出本页作答'), 1500)
     }
 
     function loadPayload() {
@@ -843,6 +919,10 @@
       }
       try {
         const p = JSON.parse(ta.value)
+        if (!p || !Array.isArray(p.items)) {
+          stats.innerHTML = '<span style="color:#dc2626">内容不是答案桥导出的答案</span>'
+          return null
+        }
         state.payload = p
         return p
       } catch (e) {
@@ -878,13 +958,16 @@
       })
     }
 
-    previewBtn.onclick = () => {
+    /** 预览：只算匹配结果，不动页面 */
+    function runPreview() {
       const payload = loadPayload()
       if (!payload) return
       state.plans = buildPlans(payload)
       document.querySelectorAll('.cx-ab-mark').forEach(e => e.classList.remove('cx-ab-mark'))
       renderPlans(state.plans)
     }
+
+    previewBtn.onclick = runPreview
 
     applyBtn.onclick = async () => {
       const payload = loadPayload()
